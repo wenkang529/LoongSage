@@ -56,6 +56,7 @@ ______________________________________________________________________
 
 ## 📰 最新动态 (News)
 
+- **[2026-10]** 技术报告 [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) 已在 arXiv 发布！
 - **[2026-08]** LoongSage 正式开源！
 
 ______________________________________________________________________
