@@ -73,6 +73,7 @@ Sandbox 后端配置属于数据源，可在单数据源模板 `data_source.sand
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
 | `sandbox.type` | `none` | 当前数据源的 sandbox 后端。 | 可选 `none` / `k8s` / `docker` / 已注册的自定义类型；需要 sandbox 的 agent 必须选择非 `none` 后端。 |
+| `sandbox.max_concurrency` | `0` | 当前数据源同时在用的 sandbox 上限，即同时在跑的 multi-turn attempt 数；超出的 trajectory 排队等待，`0` 表示不限。 | 由 AgentFlow 消费，不传给后端；`type: none` 时不生效。一个名额覆盖 attempt 的整个 sandbox 生命周期（创建 → agent 执行 → 删除），排队时间不计入 `sandbox_creation_timeout_seconds`。 |
 | `sandbox.command_exec_timeout_seconds` | 未设置 | sandbox 内单次命令执行超时（秒）。 | 由后端决定；内置 K8s 后端的兜底值为 120 秒。 |
 | `sandbox.sandbox_creation_timeout_seconds` | 未设置 | sandbox 实例创建超时（秒）。 | 由后端决定；内置 K8s 后端的兜底值为 120 秒。 |
 | `sandbox.working_dir` | 未设置 | sandbox 内默认工作目录。 | K8s 后端默认 `/rl-sandbox`，Docker 后端默认 `/testbed`；agent 调用可按命令覆盖。 |

@@ -92,6 +92,9 @@ class AgentFlow:
         self.ds_sandbox_clients: dict[int, SandboxClient | None] = {}
         self._sandbox_ids: dict[str, str] = {}
         self._sandbox_contexts: dict[str, dict[str, Any]] = {}
+        # Optional per-data-source cap (sandbox.max_concurrency) on sandboxes in use,
+        # i.e. on concurrent multi-turn attempts of that source.
+        self._ds_sandbox_sems: dict[int, asyncio.Semaphore] = {}
         self.router = None
         self.tokenizer_manager: BaseTokenizerManager | None = None
         self._active_tasks: set[asyncio.Task] = set()
@@ -196,8 +199,12 @@ class AgentFlow:
             self.ds_configs[idx] = ds_cfg
             rollout_mode = get_rollout_mode(ds_cfg)
 
-            sandbox_config = ds_cfg.get("sandbox")
+            sandbox_config = dict(ds_cfg.sandbox)
+            max_concurrency = int(sandbox_config.pop("max_concurrency"))
             self.ds_sandbox_clients[idx] = create_sandbox_client(sandbox_config)
+            if self.ds_sandbox_clients[idx] is not None and max_concurrency > 0:
+                self._ds_sandbox_sems[idx] = asyncio.Semaphore(max_concurrency)
+                logger.info("[init] ds[%d] sandbox max_concurrency=%d", idx, max_concurrency)
 
             # Agent
             if rollout_mode == _ROLLOUT_SINGLE_TURN:
@@ -440,6 +447,17 @@ class AgentFlow:
         return attempt_traj_template
 
     async def _execute_multi_turn(self, traj: Trajectory, attempt_id: int) -> Reward:
+        """Execute one multi-turn attempt, bounded by the source's sandbox.max_concurrency.
+
+        The slot covers the attempt's whole sandbox lifetime (setup_sandbox or the
+        agent's own create -> run -> release), so it caps sandboxes in use. An
+        asyncio semaphore is released on cancellation, so abort() cannot leak slots.
+        """
+        sandbox_sem = self._ds_sandbox_sems.get(traj.ds_index)
+        async with sandbox_sem or contextlib.nullcontext():
+            return await self._run_multi_turn_attempt(traj, attempt_id)
+
+    async def _run_multi_turn_attempt(self, traj: Trajectory, attempt_id: int) -> Reward:
         """Execute one multi-turn attempt via an Agent instance."""
         ds_index = traj.ds_index
         ds_cfg = self.ds_configs[ds_index]

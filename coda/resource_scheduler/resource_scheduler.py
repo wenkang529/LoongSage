@@ -142,7 +142,7 @@ class ResourceScheduler:
             ).remote()
             try:
                 ip, gpu_ids = ray.get(probe.get_ip_and_gpu_id.remote())
-                return ip, gpu_ids[0] if gpu_ids else -1
+                return ip, int(gpu_ids[0]) if gpu_ids else -1
             except Exception as e:
                 last_exception = e
                 logging.warning(
