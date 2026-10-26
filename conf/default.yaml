@@ -20,7 +20,10 @@ fully_async:
 # Default values for each entry in data_sources below. Every data_source_unit
 # inherits these defaults; per-unit overrides take precedence.
 data_source:
-  sandbox: {type: none}
+  sandbox:
+    type: none
+    # concurrent multi-turn attempts; 0 = unlimited.
+    max_concurrency: 0
   dataset:
     # Path to the prompt dataset file (.jsonl or .parquet), or to a directory containing such files
     # (all of them are read, in sorted path order).

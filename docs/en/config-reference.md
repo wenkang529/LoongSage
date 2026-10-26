@@ -73,6 +73,7 @@ Sandbox backend configuration belongs to a data source. Set it on the single-sou
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
 | `sandbox.type` | `none` | Sandbox backend for this data source. | One of `none` / `k8s` / `docker` / a registered custom type. An agent that requires a sandbox needs a non-`none` backend. |
+| `sandbox.max_concurrency` | `0` | Maximum number of sandboxes this data source uses at once, i.e. concurrent multi-turn attempts; extra trajectories wait in a queue. `0` means unlimited. | Consumed by AgentFlow and not passed to the backend; has no effect with `type: none`. One slot covers an attempt's whole sandbox lifetime (create → agent run → delete), and queueing time does not count toward `sandbox_creation_timeout_seconds`. |
 | `sandbox.command_exec_timeout_seconds` | not set | Timeout for one command inside the sandbox (seconds). | Backend-specific; the built-in K8s fallback is 120 seconds. |
 | `sandbox.sandbox_creation_timeout_seconds` | not set | Sandbox-instance creation timeout (seconds). | Backend-specific; the built-in K8s fallback is 120 seconds. |
 | `sandbox.working_dir` | not set | Default working directory inside the sandbox. | Backend default: `/rl-sandbox` for K8s, `/testbed` for Docker. An agent may override it per command. |
@@ -422,10 +423,3 @@ With OPD enabled there are four divisibility rules on the teacher side, all vali
 - [Custom RL Algorithm Development Guide](custom-algorithm.md) / [Custom KL Algorithm Development Guide](custom-kl.md) / [Custom Sliding Window Strategy Development Guide](custom-sliding-window.md): algorithm-side extension points
 - [On-Policy Distillation](on-policy-distillation.md): OPD in detail
 - [Train-Inference Consistency](train-inference-consistency.md): training / inference alignment
-
-
-
-
-
-
-
