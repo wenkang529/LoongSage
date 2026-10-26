@@ -42,6 +42,7 @@ RUN MAX_JOBS=16 pip install -v --no-build-isolation "flash-attn-3 @ git+https://
 # patch
 COPY patch /tmp/patch
 RUN cd /sgl-workspace/sglang && git apply /tmp/patch/sglang-0.5.21.patch
+RUN cd /sgl-workspace/sglang && git apply /tmp/patch/sglang-0.5.21-lora-channel.patch
 # for dsv41
 RUN cd /sgl-workspace/Megatron-LM && git apply /tmp/patch/dsv41/megatron-core.patch
 RUN cd /sgl-workspace/Megatron-Bridge && git apply /tmp/patch/dsv41/megatron-bridge.patch
