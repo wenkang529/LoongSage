@@ -22,10 +22,12 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from coda.backends.megatron.checkpoint import async_calls
 from megatron.bridge import AutoBridge
 from megatron.bridge.models import GPTModelProvider
+from megatron.bridge.peft.lora import LoRA
 from coda.transfer_mesh import ChannelMeta, create_sender_channel
 
 from coda.backends.train_worker import TrainWorker
 from coda.utils.tensor_backuper import TensorBackuper
+from coda.utils.lora_utils import hf_lora_target_modules, lora_delta_sync_enabled
 from coda.utils.memory_utils import print_memory, clear_memory
 from coda.utils.checkpoint_utils import (
     find_latest_ckpt_path, resolve_dist_ckpt_dir, update_latest, get_ckpt_dir, get_hf_dir
@@ -141,16 +143,42 @@ class MegatronTrainWorker(TrainWorker):
             )
         assert config.algorithm.clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
 
+        lora = config.megatron.get("lora")
+        lora_enabled = lora is not None and lora.get("enable", False)
+
         if config.algorithm.ref_kl.enable:
             if config.algorithm.ref_kl.kl_type not in {"k1", "k2", "k3"}:
                 raise ValueError(
                     "algorithm.ref_kl.kl_type must be one of: k1, k2, k3."
                 )
-            if not (config.ref_dist_ckpt_path or config.ref_hf_model_path):
+            if lora_enabled:
+                if config.ref_dist_ckpt_path or config.ref_hf_model_path not in (
+                    None, config.get("hf_model_path")
+                ):
+                    raise ValueError(
+                        "With megatron.lora.enable=True the ref model is the frozen base "
+                        "(actor with adapters disabled); leave ref_dist_ckpt_path and "
+                        "ref_hf_model_path unset."
+                    )
+            elif not (config.ref_dist_ckpt_path or config.ref_hf_model_path):
                 raise ValueError(
                     "algorithm.ref_kl.enable=True requires either "
                     "ref_dist_ckpt_path or ref_hf_model_path to be set."
                 )
+
+        if lora_enabled:
+            if lora.get("rank", 0) <= 0:
+                raise ValueError(
+                    "megatron.lora.enable=True requires megatron.lora.rank > 0."
+                )
+            if not lora.get("target_modules"):
+                raise ValueError(
+                    "megatron.lora.enable=True requires a non-empty "
+                    "megatron.lora.target_modules (TE/mcore names, e.g. "
+                    "[linear_qkv, linear_proj, linear_fc1, linear_fc2])."
+                )
+            if lora_delta_sync_enabled(config):
+                hf_lora_target_modules(lora.target_modules)
 
         return config
 
@@ -248,6 +276,20 @@ class MegatronTrainWorker(TrainWorker):
         megatron_ddp_config = DistributedDataParallelConfig(
             **OmegaConf.to_container(config.megatron.ddp_config)
         )
+
+        # Appended (not provide_distributed_model(pre_wrap_hook=...), which would drop
+        # the HF weight-loading hook) so the base is loaded, then frozen before DDP wrap.
+        lora_cfg = config.megatron.get("lora")
+        self.lora = None
+        if lora_cfg is not None and lora_cfg.get("enable", False):
+            self.lora = LoRA(
+                target_modules=list(lora_cfg.target_modules),
+                dim=lora_cfg.rank,
+                alpha=lora_cfg.alpha,
+                dropout=float(lora_cfg.get("dropout", 0.0)),
+                share_expert_adapters=bool(lora_cfg.get("share_expert_adapters", True)),
+            )
+            provider.register_pre_wrap_hook(partial(self.lora, training=True))
         self.model = provider.provide_distributed_model(
             ddp_config=megatron_ddp_config,
             wrap_with_ddp=True,
@@ -278,6 +320,8 @@ class MegatronTrainWorker(TrainWorker):
             logger.info(f"[Rank {self.rank}] Checkpoint loaded from {ckpt_dir}")
         self.offloaded = False
         self.params_offloaded = False
+        self._frozen_param_list = None
+        self._frozen_param_cpu = {}
 
         # Step 9: build KL policy instances and set up teacher lm_heads if an
         # active policy needs teacher logits (full_kl/full_jsd). The
@@ -285,15 +329,11 @@ class MegatronTrainWorker(TrainWorker):
         self.kl_policies = self._init_kl_policies()
 
         if config.fully_async.enable or config.algorithm.ref_kl.enable:
-            self._weights_backuper = TensorBackuper(
-                source_getter=lambda: (
-                    (f"chunk{i}.{name}", param)
-                    for i, m in enumerate(self.model)
-                    for name, param in m.named_parameters()
-                ),
-            )
+            self._weights_backuper = TensorBackuper(source_getter=self._snapshot_params)
 
         self._active_model_tag = "actor"
+        # LoRA: ref is the actor with adapters disabled until a moving-ref snapshot exists.
+        self._ref_is_base = False
 
         if config.fully_async.enable:
             # Step 10: install train metrics aggregator for fully_async mode.
@@ -303,6 +343,13 @@ class MegatronTrainWorker(TrainWorker):
         self._setup_ref_model()
 
         logger.info(f"[Rank {self.rank}] MegatronTrainWorker initialization complete")
+
+    def _snapshot_params(self):
+        """Params held by actor/ref/old_actor snapshots. With LoRA the frozen base is shared, so only the adapter."""
+        for i, m in enumerate(self.model):
+            for name, param in m.named_parameters():
+                if self.lora is None or param.requires_grad:
+                    yield f"chunk{i}.{name}", param
 
     @torch.no_grad()
     def _setup_ref_model(self):
@@ -315,6 +362,11 @@ class MegatronTrainWorker(TrainWorker):
         """
         ref_kl = self.config.algorithm.ref_kl
         if not ref_kl.enable:
+            return
+
+        if self.lora is not None:
+            self._ref_is_base = True
+            logger.info(f"[Rank {self.rank}] Reference model for ref-KL: frozen base (adapters disabled)")
             return
 
         self._weights_backuper.backup("actor")  # snapshot current student weights
@@ -440,6 +492,7 @@ class MegatronTrainWorker(TrainWorker):
 
             if ref_kl.update_interval > 0 and step % ref_kl.update_interval == 0:
                 self._weights_backuper.backup("ref")
+                self._ref_is_base = False
                 logger.info(f"[Rank {self.rank}] Ref-model update at step {step}")
 
     def _compute_token_metric(
@@ -563,14 +616,28 @@ class MegatronTrainWorker(TrainWorker):
     @override
     @torch.no_grad()
     def update_weights(self, channel_meta: ChannelMeta):
-        """Update weights"""
+        """Update weights.
+
+        LoRA merge=false (``lora_name`` set): ships the unmerged base, or only the
+        adapter when ``lora_adapter_sync``. Otherwise ships merged full weights.
+        """
         if self.params_offloaded:
             self._onload_model(move_params=True, move_grads=False)
             self.params_offloaded = False
             clear_memory()
         print_memory("before send huggingface weights")
         send_channel = create_sender_channel(channel_meta)
-        for name, tensor, in self.bridge.export_hf_weights(self.model):
+        adapter_only = channel_meta.lora_adapter_sync
+        merge_adapter = channel_meta.lora_name is None
+        weight_iter = (
+            self.bridge.export_adapter_weights(self.model, cpu=False)
+            if adapter_only
+            else self.bridge.export_hf_weights(self.model, merge_adapter_weights=merge_adapter)
+        )
+        for name, tensor in weight_iter:
+            if not merge_adapter and not adapter_only:
+                # SGLang load_weights silently skips PEFT names like q_proj.base_layer.weight.
+                name = name.replace(".base_layer.", ".")
             send_channel.send((name, tensor))
         send_channel.send(None, flush=True)
         if self.offloaded:
@@ -614,12 +681,65 @@ class MegatronTrainWorker(TrainWorker):
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.offload_to_cpu(move_params, move_grads)
+        if move_params:
+            self._offload_frozen_params()
 
     def _onload_model(self, move_params: bool = True, move_grads: bool = True):
         """Onload model parameters and gradients from CPU."""
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.reload_from_cpu(move_params, move_grads)
+        if move_params:
+            self._onload_frozen_params()
+
+    def _frozen_params(self) -> list[torch.nn.Parameter]:
+        """LoRA-frozen base params: not in DDP buffers, so offloaded separately.
+
+        Views that do not own their storage stay on GPU (resizing would hit aliases).
+        """
+        if self.lora is None:
+            return []
+        if self._frozen_param_list is None:
+            params, skipped = [], 0
+            for chunk in self.model:
+                for p in chunk.parameters():
+                    if p.requires_grad or not p.is_cuda:
+                        continue
+                    if (
+                        p.storage_offset() == 0
+                        and p.untyped_storage().nbytes() == p.numel() * p.element_size()
+                    ):
+                        params.append(p)
+                    else:
+                        skipped += 1
+            self._frozen_param_list = params
+            logger.info(
+                f"[Rank {self.rank}] frozen-param offload: {len(params)} params "
+                f"({sum(p.numel() * p.element_size() for p in params) / 2**30:.2f} GiB), "
+                f"{skipped} non-owning views kept on GPU"
+            )
+        return self._frozen_param_list
+
+    def _offload_frozen_params(self):
+        for p in self._frozen_params():
+            storage = p.untyped_storage()
+            if storage.nbytes() == 0:
+                continue
+            cpu = self._frozen_param_cpu.get(p)
+            if cpu is None:
+                cpu = torch.empty_like(p.data, device="cpu", pin_memory=True)
+                self._frozen_param_cpu[p] = cpu
+            # Always copy: TensorBackuper.restore() may have rewritten the param.
+            cpu.copy_(p.data, non_blocking=True)
+            storage.resize_(0)
+
+    def _onload_frozen_params(self):
+        for p in self._frozen_params():
+            storage = p.untyped_storage()
+            if storage.nbytes() != 0:
+                continue
+            storage.resize_(p.numel() * p.element_size())
+            p.data.copy_(self._frozen_param_cpu[p], non_blocking=True)
 
     def _move_optimizer(self, device):
         """Move GPU-resident optimizer state (master params + Adam moments) to ``device``.
@@ -780,9 +900,13 @@ class MegatronTrainWorker(TrainWorker):
         pass (no PG policy), then swaps back to "actor". Eval mode is set by the
         caller.
         """
-        self.switch("ref")
-        collected_all = self._forward_only_log_probs(rollout_data, step, pg_policy=None)
-        self.switch("actor")
+        if self._ref_is_base:
+            with self.lora.disable_adapter(self.model):
+                collected_all = self._forward_only_log_probs(rollout_data, step, pg_policy=None)
+        else:
+            self.switch("ref")
+            collected_all = self._forward_only_log_probs(rollout_data, step, pg_policy=None)
+            self.switch("actor")
         return {"ref_log_probs": collected_all.get("log_probs")}
 
     @torch.no_grad()
