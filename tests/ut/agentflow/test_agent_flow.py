@@ -1077,8 +1077,31 @@ class TestExecuteMultiTurn:
 
         reward_fn.prepare_sandbox.assert_not_called()
         client.create.assert_not_called()
-        metadata = agent.run_trajectory.call_args.args[0]["metadata"]
-        assert metadata["asset_digest"] == "trusted"
+        passed = agent.run_trajectory.call_args.args[0]
+        assert passed["metadata"]["asset_digest"] == "trusted"
+        assert passed["resume"] is True
+
+    @pytest.mark.asyncio
+    async def test_partial_resume_passes_history_and_initial_prompt(self):
+        """Resume hands agents the active-segment history plus the original dataset prompt."""
+        af, traj = self._setup()
+        traj.prompt = [{"role": "user", "content": "fix the bug"}]
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        traj.chat_completions = {0: history}
+        agent = self._agent_completing(af, traj, Reward(final_reward=1.0))
+
+        await af._execute_multi_turn(traj, 0)
+
+        passed = agent.run_trajectory.call_args.args[0]
+        assert passed["prompt"] == history
+        assert passed["initial_prompt"] == [{"role": "user", "content": "fix the bug"}]
+        # History alone (e.g. a retry whose sandbox was released) is not a resume.
+        assert passed["resume"] is False
 
     @pytest.mark.asyncio
     async def test_reuses_pooled_sandbox_id_without_creating(self):

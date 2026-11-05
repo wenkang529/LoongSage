@@ -85,10 +85,9 @@ class AgentFlow:
         self.partial_rollout_enabled = self.config.rollout.partial
         self.mask_offpolicy_in_partial_rollout = self.config.rollout.mask_offpolicy_in_partial_rollout
         self.trajectory_store = TrajectoryStore()
-        # One stateless backend client per data source, shared by every trajectory
-        # of that source. Live sandbox ids are retained per trajectory across
-        # partial resume, along with the opaque reward-preparation data — when the
-        # reward function has any — produced for that exact container.
+        # ds_sandbox_clients: one shared sandbox client per data source.
+        # _sandbox_ids / _sandbox_contexts: per-trajectory sandbox id and its
+        # prepare_sandbox result, kept so partial resume reuses the same sandbox.
         self.ds_sandbox_clients: dict[int, SandboxClient | None] = {}
         self._sandbox_ids: dict[str, str] = {}
         self._sandbox_contexts: dict[str, dict[str, Any]] = {}
@@ -468,10 +467,11 @@ class AgentFlow:
         max_response_len_per_trajectory = int(ds_cfg.max_response_len_per_trajectory)
 
         sandbox_client = self.ds_sandbox_clients.get(ds_index)
-        # The preparation result belongs to that exact sandbox instance, so it is
-        # retained with it and never recomputed after a partial resume.
+        # Reuse the sandbox and its prepare_sandbox result on partial resume;
+        # re-preparing would snapshot the already-modified workspace.
         sandbox_id = self._sandbox_ids.get(traj.trajectory_id)
         sandbox_context = self._sandbox_contexts.get(traj.trajectory_id, {})
+        resume = sandbox_id is not None
         agent = None
         keep_sandbox = False
         try:
@@ -490,8 +490,10 @@ class AgentFlow:
             )
             reward = await agent.run_trajectory({
                 "prompt": copy.deepcopy(_active_chat(traj)),
+                "initial_prompt": copy.deepcopy(traj.prompt),
                 "label": copy.deepcopy(traj.label),
                 "metadata": {**copy.deepcopy(traj.metadata), **sandbox_context},
+                "resume": resume,
             })
 
             attempts = self.trajectory_store.get(
@@ -518,7 +520,6 @@ class AgentFlow:
                 if agent is not None:
                     await agent.close()
             finally:
-                # The agent creates its own sandbox when no prepare_sandbox exists.
                 if agent is not None:
                     sandbox_id = agent.sandbox_id
                 if sandbox_id is not None:
