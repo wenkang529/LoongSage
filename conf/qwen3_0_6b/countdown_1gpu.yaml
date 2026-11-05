@@ -1,5 +1,15 @@
 # @package _global_
-# Qwen3-0.6B Countdown on a single A10 (24GB) GPU (colocated rollout + training).
+# Qwen3-0.6B + Countdown, single GPU(A10, 4090) (colocated rollout + training).
+#
+# Download model and dataset:
+#   hf download Qwen/Qwen3-0.6B --local-dir /root/Qwen3-0.6B
+#   hf download Jiayi-Pan/Countdown-Tasks-3to4 --repo-type=dataset \
+#     --local-dir /root/Countdown-Tasks-3to4
+#
+# Launch:
+#   bash examples/start.sh qwen3_0_6b/countdown_1gpu \
+#     hf_model_path=/root/Qwen3-0.6B \
+#     data_source.dataset.prompt_data_path=/root/Countdown-Tasks-3to4
 defaults:
   - /default
   - _self_
